@@ -23,6 +23,7 @@ import (
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/resources/secrets"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/resources/serviceports"
 	ss "github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/resources/statefulsets"
+	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/templates"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/utils/common"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/utils/jolokia_client"
 	"github.com/arkmq-org/arkmq-org-broker-operator/v2/pkg/utils/namer"
@@ -811,27 +812,24 @@ func (reconciler *BrokerReconcilerImpl) PodTemplateSpecForCR(customResource *v1b
 
 	additionalSystemProps := []string{}
 	{
+		var err error
 		mountPathRoot := common.SecretPathBase + getPropertiesResourceNsNameForBroker(customResource).Name
-		securityProperties := brokerproperties.NewPropsWithHeader()
-		fmt.Fprintf(securityProperties, "login.config.url.1=file:%s/login.config\n", mountPathRoot)
-		fmt.Fprintf(securityProperties, "security.provider.13=de.dentrassi.crypto.pem.PemKeyStoreProvider\n")
-		fmt.Fprintf(securityProperties, "fips.provider.8=de.dentrassi.crypto.pem.PemKeyStoreProvider\n")
-
-		brokerPropertiesMapData["_security.config"] = securityProperties.Bytes()
+		if brokerPropertiesMapData["_security.config"], err = templates.Render(templates.Security, templates.SecurityConfig{
+			MountPathRoot: mountPathRoot,
+		}); err != nil {
+			return nil, err
+		}
 
 		additionalSystemProps = append(additionalSystemProps, fmt.Sprintf("-Djava.security.properties=%s/_security.config", mountPathRoot))
 
-		loginConfig := brokerproperties.NewBufferWithHeader("//")
-		fmt.Fprintf(loginConfig, "%s {\n", common.HttpAuthenticatorRealm)
-		fmt.Fprintln(loginConfig, "  org.apache.activemq.artemis.spi.core.security.jaas.TextFileCertificateLoginModule required")
-		fmt.Fprintln(loginConfig, "   reload=true")
-		fmt.Fprintln(loginConfig, "   debug=true")
-		fmt.Fprintf(loginConfig, "   org.apache.activemq.jaas.textfiledn.user=%s\n", common.GetCertUsersKey(common.HttpAuthenticatorRealm))
-		fmt.Fprintf(loginConfig, "   org.apache.activemq.jaas.textfiledn.role=%s\n", common.GetCertRolesKey(common.HttpAuthenticatorRealm))
-		fmt.Fprintf(loginConfig, "   baseDir=\"%v\"\n", mountPathRoot)
-		fmt.Fprintln(loginConfig, "  ;")
-		fmt.Fprintln(loginConfig, "};")
-		brokerPropertiesMapData["login.config"] = loginConfig.Bytes()
+		if brokerPropertiesMapData[brokerproperties.JaasConfigKey], err = templates.Render(templates.Login, templates.LoginConfig{
+			Realm:         common.HttpAuthenticatorRealm,
+			MountPathRoot: mountPathRoot,
+			CertUsersKey:  common.GetCertUsersKey(common.HttpAuthenticatorRealm),
+			CertRolesKey:  common.GetCertRolesKey(common.HttpAuthenticatorRealm),
+		}); err != nil {
+			return nil, err
+		}
 
 		operandCertSecretName := common.GetOperandCertSecretName(customResource, client)
 		operandCertSecret, err := common.GetNamespacedSecret(client, operandCertSecretName, customResource.Namespace)
@@ -879,21 +877,18 @@ func (reconciler *BrokerReconcilerImpl) PodTemplateSpecForCR(customResource *v1b
 		// TODO - make configuable
 		// support <crNname->control-plane-auth-secret, maybe a suffix for the http_server_authenticator realm login.config
 
-		certUser := brokerproperties.NewPropsWithHeader()
-		fmt.Fprintln(certUser, "hawtio=/CN = hawtio-online\\.hawtio\\.svc.*/")
-		fmt.Fprintf(certUser, "operator=/.*%s.*/\n", operatorCertSubject.CommonName) // regexp syntax start and with /
-		// can and should use the full DN after https://issues.apache.org/jira/browse/ARTEMIS-5102
-		fmt.Fprintf(certUser, "probe=/.*%s.*/\n", operandCertSubject.CommonName)
+		prometheusCN := ""
 		if prometheusCertSubject != nil {
-			fmt.Fprintf(certUser, "prometheus=/.*%s.*/\n", prometheusCertSubject.CommonName)
+			prometheusCN = prometheusCertSubject.CommonName
 		}
-		brokerPropertiesMapData[common.GetCertUsersKey(common.HttpAuthenticatorRealm)] = certUser.Bytes()
-
-		certRoles := brokerproperties.NewPropsWithHeader()
-		fmt.Fprintln(certRoles, "status=operator,probe")
-		fmt.Fprintln(certRoles, "metrics=operator,prometheus")
-		fmt.Fprintln(certRoles, "hawtio=hawtio")
-		brokerPropertiesMapData[common.GetCertRolesKey(common.HttpAuthenticatorRealm)] = certRoles.Bytes()
+		if brokerPropertiesMapData[common.GetCertUsersKey(common.HttpAuthenticatorRealm)], err = templates.Render(templates.CertUsers, templates.CertUsersConfig{
+			OperatorCN:   operatorCertSubject.CommonName,
+			OperandCN:    operandCertSubject.CommonName,
+			PrometheusCN: prometheusCN,
+		}); err != nil {
+			return nil, err
+		}
+		brokerPropertiesMapData[common.GetCertRolesKey(common.HttpAuthenticatorRealm)] = templates.RenderCertRoles()
 
 		foundationalProps := brokerproperties.NewPropsWithHeader()
 		fmt.Fprintf(foundationalProps, "name=%s\n", environments.ResolveBrokerNameFromEnvs(customResource.Spec.Env, customResource.Name))
@@ -929,68 +924,30 @@ func (reconciler *BrokerReconcilerImpl) PodTemplateSpecForCR(customResource *v1b
 		caSecret := common.GetOperatorCASecretName()
 		secretsToMount = append(secretsToMount, caSecret)
 
-		jolokiaConfig := brokerproperties.NewPropsWithHeader()
-		fmt.Fprintln(jolokiaConfig, "protocol=https")
-		fmt.Fprintln(jolokiaConfig, "authClass=org.apache.activemq.artemis.spi.core.security.jaas.HttpServerAuthenticator")
-		fmt.Fprintf(jolokiaConfig, "caCert=%s%s/%s\n", common.SecretPathBase, caSecret, caSecretKey)
-		fmt.Fprintf(jolokiaConfig, "serverCert=%s%s/tls.crt\n", common.SecretPathBase, operandCertSecretName)
-		fmt.Fprintf(jolokiaConfig, "serverKey=%s%s/tls.key\n", common.SecretPathBase, operandCertSecretName)
-		fmt.Fprintln(jolokiaConfig, "port=8778")
-		// https://github.com/jolokia/jolokia/issues/751 at some point host=$(env:HOSTNAME), host= is on the command line below
-		fmt.Fprintln(jolokiaConfig, "useSslClientAuthentication=true")
-		fmt.Fprintln(jolokiaConfig, "disabledServices=org.jolokia.service.history.HistoryMBeanRequestInterceptor")
-		fmt.Fprintln(jolokiaConfig, "disableDetectors=true")
-		fmt.Fprintln(jolokiaConfig, "debug=false")
+		certSecretPath := common.SecretPathBase + operandCertSecretName
+		caCertPath := fmt.Sprintf("%s%s/%s", common.SecretPathBase, caSecret, caSecretKey)
 
-		brokerPropertiesMapData["_jolokia.config"] = jolokiaConfig.Bytes()
-
-		pemCfg := brokerproperties.NewPropsWithHeader()
-
-		fmt.Fprintf(pemCfg, "alias=alias\n")
-		fmt.Fprintf(pemCfg, "source.cert=%s%s/tls.crt\n", common.SecretPathBase, operandCertSecretName)
-		fmt.Fprintf(pemCfg, "source.key=%s%s/tls.key\n", common.SecretPathBase, operandCertSecretName)
-		brokerPropertiesMapData["_cert.pemcfg"] = pemCfg.Bytes()
-
-		prometheusConfig := brokerproperties.NewPropsWithHeader() // yaml
-		fmt.Fprintf(prometheusConfig, "httpServer:\n")
-		fmt.Fprintf(prometheusConfig, "  authentication:\n")
-		fmt.Fprintf(prometheusConfig, "    plugin:\n")
-		fmt.Fprintf(prometheusConfig, "      class: org.apache.activemq.artemis.spi.core.security.jaas.HttpServerAuthenticator\n")
-		fmt.Fprintf(prometheusConfig, "      subjectAttributeName: org.jolokia.jaasSubject\n") // match -DhttpServerAuthenticator.requestSubjectAttribute
-		fmt.Fprintf(prometheusConfig, "  ssl:\n")
-		fmt.Fprintf(prometheusConfig, "    mutualTLS: true\n")
-		fmt.Fprintf(prometheusConfig, "    keyStore:\n")
-		fmt.Fprintf(prometheusConfig, "      filename: %s/_cert.pemcfg\n", mountPathRoot)
-		fmt.Fprintf(prometheusConfig, "      type: PEMCFG\n")
-		fmt.Fprintf(prometheusConfig, "    trustStore:\n")
-		fmt.Fprintf(prometheusConfig, "      filename: %s%s/%s\n", common.SecretPathBase, caSecret, caSecretKey)
-		fmt.Fprintf(prometheusConfig, "      type: PEMCA\n")
-		fmt.Fprintf(prometheusConfig, "    certificate:\n")
-		fmt.Fprintf(prometheusConfig, "      alias: alias\n")
-		// the collector/scraper config
-		fmt.Fprintf(prometheusConfig, "lowercaseOutputName: true\n")
-		fmt.Fprintf(prometheusConfig, "lowercaseOutputLabelNames: true\n")
-		fmt.Fprintf(prometheusConfig, "includeObjectNames: [org.apache.activemq.artemis:broker=\"%s\"]\n", environments.ResolveBrokerNameFromEnvs(customResource.Spec.Env, customResource.Name))
-		fmt.Fprintf(prometheusConfig, "includeObjectNameAttributes:\n")
-		fmt.Fprintf(prometheusConfig, "  'org.apache.activemq.artemis:broker=\"%s\"':\n", environments.ResolveBrokerNameFromEnvs(customResource.Spec.Env, customResource.Name))
-		fmt.Fprintf(prometheusConfig, "    - \"TotalMessageCount\"\n")
-		fmt.Fprintf(prometheusConfig, "    - \"TotalMessagesAdded\"\n")
-		fmt.Fprintf(prometheusConfig, "    - \"TotalMessagesAcknowledged\"\n")
-		fmt.Fprintf(prometheusConfig, "rules:\n")
-		fmt.Fprintf(prometheusConfig, "  - pattern: 'org.apache.activemq.artemis<broker=\"%s\"><>TotalMessageCount'\n", environments.ResolveBrokerNameFromEnvs(customResource.Spec.Env, customResource.Name))
-		fmt.Fprintf(prometheusConfig, "    help: Number of pending messages\n")
-		fmt.Fprintf(prometheusConfig, "    name: artemis_total_pending_message_count\n")
-		fmt.Fprintf(prometheusConfig, "    type: GAUGE\n")
-		fmt.Fprintf(prometheusConfig, "  - pattern: 'org.apache.activemq.artemis<broker=\"%s\"><>TotalMessagesAcknowledged'\n", environments.ResolveBrokerNameFromEnvs(customResource.Spec.Env, customResource.Name))
-		fmt.Fprintf(prometheusConfig, "    help: Number of messages consumed since start\n")
-		fmt.Fprintf(prometheusConfig, "    name: artemis_total_consumed_message_count\n")
-		fmt.Fprintf(prometheusConfig, "    type: COUNTER\n")
-		fmt.Fprintf(prometheusConfig, "  - pattern: 'org.apache.activemq.artemis<broker=\"%s\"><>TotalMessagesAdded'\n", environments.ResolveBrokerNameFromEnvs(customResource.Spec.Env, customResource.Name))
-		fmt.Fprintf(prometheusConfig, "    help: Number of messages produced since start\n")
-		fmt.Fprintf(prometheusConfig, "    name: artemis_total_produced_message_count\n")
-		fmt.Fprintf(prometheusConfig, "    type: COUNTER\n")
-
-		brokerPropertiesMapData[PrometheusConfigFileName] = prometheusConfig.Bytes()
+		if brokerPropertiesMapData["_jolokia.config"], err = templates.Render(templates.Jolokia, templates.JolokiaConfig{
+			CACertPath:     caCertPath,
+			ServerCertPath: certSecretPath + "/tls.crt",
+			ServerKeyPath:  certSecretPath + "/tls.key",
+		}); err != nil {
+			return nil, err
+		}
+		if brokerPropertiesMapData["_cert.pemcfg"], err = templates.Render(templates.PemCfg, templates.PemCfgConfig{
+			Alias:       "alias",
+			CertKeyPath: certSecretPath + "/tls.key",
+			CertCrtPath: certSecretPath + "/tls.crt",
+		}); err != nil {
+			return nil, err
+		}
+		if brokerPropertiesMapData[PrometheusConfigFileName], err = templates.Render(templates.BrokerPrometheus, templates.BrokerPrometheusConfig{
+			PemCfgPath:       mountPathRoot + "/_cert.pemcfg",
+			CATrustStorePath: caCertPath,
+			BrokerName:       environments.ResolveBrokerNameFromEnvs(customResource.Spec.Env, customResource.Name),
+		}); err != nil {
+			return nil, err
+		}
 
 		// Apply control plane overrides if they exist
 		if err := applyControlPlaneOverridesForBroker(customResource, client, brokerPropertiesMapData); err != nil {
